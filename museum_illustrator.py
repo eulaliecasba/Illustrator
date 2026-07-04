@@ -529,21 +529,113 @@ def locate_sections(doc, sections):
                 break
 
 
-def insert_plate(doc, after_page, sec, plate_no):
-    art = sec.artwork
+def _image_aspect(path):
+    """width / height of the artwork file."""
+    try:
+        pm = fitz.Pixmap(str(path))
+        ar = pm.width / pm.height if pm.height else 1.0
+        return ar
+    except Exception:
+        return 1.0
+
+
+def _find_gaps(page, margin=54):
+    """Return vertical blank intervals (top, bottom) on the page, largest-first,
+    computed from the existing text/image blocks so nothing is overlapped."""
+    h = page.rect.height
+    blocks = [b for b in page.get_text("blocks") if b[4].strip()]
+    # include image blocks so we don't stack on existing pictures
+    for img in page.get_image_info():
+        bb = img.get("bbox")
+        if bb:
+            blocks.append((bb[0], bb[1], bb[2], bb[3], "", 0, 1))
+    spans = sorted((b[1], b[3]) for b in blocks)
+    gaps, cursor = [], margin
+    for y0, y1 in spans:
+        if y0 - cursor > 40:
+            gaps.append((cursor, y0))
+        cursor = max(cursor, y1)
+    if h - margin - cursor > 40:
+        gaps.append((cursor, h - margin))
+    gaps.sort(key=lambda g: g[1] - g[0], reverse=True)
+    return gaps
+
+
+def _place_in_gap(page, gap, art, sec, plate_no, margin=54):
+    """Fit the image (tool-picked size) into a blank gap, caption below."""
+    w = page.rect.width
+    cap_h = 30
+    top, bot = gap
+    avail_h = (bot - top) - cap_h
+    avail_w = w - 2 * margin
+    ar = _image_aspect(art.image_path)
+    if avail_w / avail_h > ar:
+        ih = avail_h
+        iw = ih * ar
+    else:
+        iw = avail_w
+        ih = iw / ar
+    cx = w / 2
+    box = fitz.Rect(cx - iw / 2, top + 4, cx + iw / 2, top + 4 + ih)
+    page.insert_image(box, filename=str(art.image_path), keep_proportion=True)
+    lines = [f"Plate {plate_no}."]
+    if sec.note:
+        lines.append(sec.note)
+    lines.append(art.citation())
+    page.insert_textbox(
+        fitz.Rect(margin, box.y1 + 3, w - margin, box.y1 + 3 + cap_h),
+        "\n".join(lines), fontsize=8, fontname="Times-Italic",
+        align=fitz.TEXT_ALIGN_CENTER, color=(0.15, 0.15, 0.15))
+
+
+def _spill_page(doc, after_page, art, sec, plate_no):
+    """No room on the page: create a dedicated plate page right after it."""
     w, h = doc[after_page].rect.width, doc[after_page].rect.height
     page = doc.new_page(pno=after_page + 1, width=w, height=h)
-    margin, caption_h = 54, 110
-    page.insert_image(fitz.Rect(margin, margin, w - margin, h - margin - caption_h),
+    margin, cap_h = 54, 110
+    page.insert_image(fitz.Rect(margin, margin, w - margin, h - margin - cap_h),
                       filename=str(art.image_path), keep_proportion=True)
     lines = [f"Plate {plate_no}."]
     if sec.note:
         lines.append(sec.note)
     lines.append(art.citation())
     page.insert_textbox(
-        fitz.Rect(margin, h - margin - caption_h + 8, w - margin, h - margin + 10),
+        fitz.Rect(margin, h - margin - cap_h + 8, w - margin, h - margin + 10),
         "\n".join(lines), fontsize=8.5, fontname="Times-Italic",
         align=fitz.TEXT_ALIGN_CENTER, color=(0.15, 0.15, 0.15))
+
+
+# Minimum gap height (points) worth placing an image into before we spill.
+MIN_INLINE_GAP = 150
+
+
+def insert_plate(doc, page_index, sec, plate_no):
+    """Place the artwork in the largest blank gap on the section's own page,
+    preferring gaps that sit at or below the section marker so the image lands
+    near the relevant text. Returns True if a new (spill) page was added."""
+    page = doc[page_index]
+    gaps = _find_gaps(page)
+
+    # Bias toward the gap nearest *below* the section marker.
+    marker_y = 0
+    hits = page.search_for(sec.marker)
+    if hits:
+        marker_y = min(r.y0 for r in hits)
+    below = [g for g in gaps if g[0] >= marker_y - 20 and (g[1] - g[0]) >= MIN_INLINE_GAP]
+    candidate = None
+    if below:
+        # nearest below the marker
+        candidate = min(below, key=lambda g: g[0])
+    else:
+        big = [g for g in gaps if (g[1] - g[0]) >= MIN_INLINE_GAP]
+        if big:
+            candidate = big[0]
+
+    if candidate:
+        _place_in_gap(page, candidate, sec.artwork, sec, plate_no)
+        return False
+    _spill_page(doc, page_index, sec.artwork, sec, plate_no)
+    return True
 
 
 def append_credits(doc, placed):
@@ -647,9 +739,12 @@ def cmd_build(args):
     matched = [s for s in matched if download_image(s.artwork, session)]
     matched.sort(key=lambda s: s.page_index)
     placed = []
-    for offset, sec in enumerate(matched):
-        insert_plate(doc, sec.page_index + offset, sec, offset + 1)
-        placed.append((offset + 1, sec))
+    spill_offset = 0  # each spill page pushes later sections down by one
+    for i, sec in enumerate(matched):
+        added = insert_plate(doc, sec.page_index + spill_offset, sec, i + 1)
+        if added:
+            spill_offset += 1
+        placed.append((i + 1, sec))
     if placed:
         append_credits(doc, placed)
     doc.save(out, deflate=True)
