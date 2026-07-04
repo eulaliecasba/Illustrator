@@ -59,7 +59,8 @@ def scan():
     with open(tmp, "wb") as f:
         f.write(data)
     try:
-        sections = mi.scan_pdf(tmp)
+        period = request.form.get("period", "any")
+        sections = mi.scan_pdf(tmp, period=period)
     finally:
         os.remove(tmp)
     prefer = [p for p in request.form.get("prefer", "").split(",") if p.strip()]

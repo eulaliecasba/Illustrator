@@ -587,28 +587,75 @@ _OBJECT_VOCAB = [
 ]
 
 
-def _object_queries(body):
-    """From a section's Latin body, return ordered museum search queries for the
-    concrete objects it mentions. Empty if nothing illustratable is found."""
+def _object_queries(body, period="any"):
+    """Return ordered museum search queries for the concrete things a section
+    mentions. For ancient texts the curated Roman-object vocabulary runs first
+    (precise), then general noun extraction fills in for any language/period."""
     low = _norm(body)
     queries, seen = [], set()
-    for stems, query in _OBJECT_VOCAB:
-        for stem in stems:
-            s = _norm(stem)
-            # match at a word boundary so stems catch inflected forms
-            if re.search(r"(^|[^a-z])" + re.escape(s), low):
-                if query not in seen:
-                    queries.append(query)
-                    seen.add(query)
-                break
+
+    # 1. Curated Roman objects (only meaningful for ancient texts, but harmless
+    #    otherwise since the stems are Latin).
+    if period in ("ancient", "any"):
+        for stems, query in _OBJECT_VOCAB:
+            for stem in stems:
+                if re.search(r"(^|[^a-z])" + re.escape(_norm(stem)), low):
+                    if query not in seen:
+                        queries.append(query)
+                        seen.add(query)
+                    break
+
+    # 2. General extraction: pull the most salient content words from the text
+    #    itself, so any-language documents get queries too.
+    for term in _salient_terms(body):
+        q = term if period in ("any", None) else f"{period} {term}"
+        # 'ancient' reads oddly as a search word; prefer a natural phrasing
+        if period == "ancient":
+            q = f"roman {term}"
+        if q not in seen:
+            queries.append(q)
+            seen.add(q)
+        if len(queries) >= 6:
+            break
     return queries
 
 
+# Very common words to ignore across a few major languages, so noun extraction
+# surfaces meaningful content terms rather than filler.
+_STOPWORDS = set("""
+the a an and or of to in on at for with from by as is are was were be been being
+this that these those it its his her their our your my he she they we you i not no
+but if then than so such which who whom whose what when where why how all any each
+into over under about after before between during without within them him them us
+est sunt cum sed quod quae qui quam atque enim autem ergo etiam iam nunc hic haec
+hoc ille illa esse erat fuit habet ad ex per pro sub ab de in ut ne nec neque aut
+vel nam quia dum tunc omnia omnes res rem eius eum eam nos vos non se sibi suo sua
+le la les des une un du de et ou dans sur pour avec par comme est sont was der die
+das und oder mit von den dem ein eine el los las una y o en con para por como
+""".split())
+
+
+def _salient_terms(body, limit=6):
+    """Pick meaningful content words (any language) by frequency, skipping
+    stopwords and very short tokens. Returns lowercased singular-ish terms."""
+    from collections import Counter
+    words = re.findall(r"[^\W\d_]{4,}", _norm(body), flags=re.UNICODE)
+    counts = Counter(w for w in words if w not in _STOPWORDS)
+    terms = []
+    for w, _ in counts.most_common(40):
+        # crude singularization for search (English plurals)
+        t = w[:-1] if len(w) > 4 and w.endswith("s") else w
+        if t not in terms:
+            terms.append(t)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
 def _body_after(page, marker, doc, page_index):
-    """Grab the Latin that follows a heading marker on its own page, so we can
-    confirm it's Latin and mine it for concrete objects. Only borrows a little
-    of the next page when this page's body is too short, to avoid pulling the
-    following section's content into this one."""
+    """Grab the body text that follows a heading marker on its own page, to mine
+    it for concrete terms. Borrows a little of the next page only when this
+    page's body is short, to avoid pulling the next section in."""
     full = page.get_text()
     idx = full.find(marker)
     body = full[idx + len(marker):] if idx >= 0 else full
@@ -622,7 +669,7 @@ def _clean_query(text):
     return re.sub(r"\s+", " ", q)
 
 
-def scan_pdf(pdf_path, max_marker_words=12):
+def scan_pdf(pdf_path, max_marker_words=12, period="any"):
     """Detect likely headings by font size and emit section dicts."""
     doc = fitz.open(pdf_path)
 
@@ -663,20 +710,18 @@ def scan_pdf(pdf_path, max_marker_words=12):
                 if key in seen:
                     continue
                 seen.add(key)
-                # Never illustrate structural headings, regardless of body text.
+                # Never illustrate structural headings, regardless of content.
                 if any(w in key for w in ("content", "table of contents",
                         "introduction", "preface", "index", "bibliography",
                         "glossary", "appendix", "notes", "acknowledg",
                         "characters", "dramatis personae")):
                     continue
-                # Only illustrate sections whose body is real Latin narrative.
+                # Choose images from what the section actually says (any
+                # language). If nothing meaningful is found, skip the section.
                 body = _body_after(doc[pno], text, doc, pno)
-                if not _looks_latin(body):
+                if len(body.strip()) < 40:
                     continue
-                # Choose images from what the Latin actually describes, not the
-                # chapter title. If the passage names no concrete object, skip it
-                # -- this keeps images tied to content and avoids clutter.
-                queries = _object_queries(body)
+                queries = _object_queries(body, period)
                 if not queries:
                     continue
                 sections.append({
