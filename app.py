@@ -82,7 +82,6 @@ def _run_build(job_id, pdf_bytes, config, min_score):
     tmp_in = f"/tmp/{job_id}_in.pdf"
     tmp_cfg = f"/tmp/{job_id}.json"
     tmp_out = f"/tmp/{job_id}_out.pdf"
-    tmp_docx = f"/tmp/{job_id}_out.docx"
     try:
         with open(tmp_in, "wb") as f:
             f.write(pdf_bytes)
@@ -103,9 +102,6 @@ def _run_build(job_id, pdf_bytes, config, min_score):
 
         with open(tmp_out, "rb") as f:
             job["pdf_bytes"] = f.read()
-        if os.path.exists(tmp_docx):
-            with open(tmp_docx, "rb") as f:
-                job["docx_bytes"] = f.read()
         job["state"] = "done"
         job["done"] = True
     except SystemExit as e:
@@ -115,7 +111,7 @@ def _run_build(job_id, pdf_bytes, config, min_score):
         job["error"] = f"{type(e).__name__}: {e}"
         job["state"] = "error"
     finally:
-        for p in (tmp_in, tmp_cfg, tmp_out, tmp_docx):
+        for p in (tmp_in, tmp_cfg, tmp_out):
             try:
                 os.remove(p)
             except OSError:
@@ -131,8 +127,7 @@ def build():
     filename = body.get("filename", "illustrated.pdf")
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"state": "queued", "log": [], "done": False,
-                    "error": None, "pdf_bytes": None, "docx_bytes": None,
-                    "filename": filename}
+                    "error": None, "pdf_bytes": None, "filename": filename}
     threading.Thread(target=_run_build,
                      args=(job_id, pdf_bytes, config, min_score),
                      daemon=True).start()
@@ -145,12 +140,7 @@ def status(job_id):
     if not job:
         abort(404)
     return jsonify(state=job["state"], log=job["log"][-40:],
-                   done=job["done"], error=job["error"],
-                   has_docx=bool(job.get("docx_bytes")))
-
-
-def _stem(name):
-    return name[:-4] if name.lower().endswith(".pdf") else name
+                   done=job["done"], error=job["error"])
 
 
 @app.get("/api/result/<job_id>")
@@ -164,18 +154,6 @@ def result(job_id):
     return send_file(io.BytesIO(job["pdf_bytes"]),
                      mimetype="application/pdf", as_attachment=True,
                      download_name=name)
-
-
-@app.get("/api/result_docx/<job_id>")
-def result_docx(job_id):
-    job = JOBS.get(job_id)
-    if not job or not job.get("docx_bytes"):
-        abort(404)
-    name = _stem(job.get("filename") or "illustrated.pdf") + ".docx"
-    return send_file(
-        io.BytesIO(job["docx_bytes"]),
-        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        as_attachment=True, download_name=name)
 
 
 if __name__ == "__main__":

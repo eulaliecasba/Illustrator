@@ -982,61 +982,6 @@ def cmd_build(args):
     doc.save(out, deflate=True)
     print(f"\nWrote {out}  ({len(placed)} images placed).")
 
-    # Companion .docx: same text, images embedded after their sections. Layout
-    # (line numbers, columns) is not preserved -- this is the editable version.
-    try:
-        docx_out = out.with_suffix(".docx")
-        _build_docx(args.pdf, matched, docx_out)
-        print(f"Wrote {docx_out}")
-    except Exception as e:
-        print(f"(docx generation skipped: {e})")
-
-
-def _build_docx(pdf_path, matched, docx_out):
-    """Editable Word version: the PDF's text with chosen images placed after the
-    section that mentions them. Reflowable, so exact layout is not preserved."""
-    from docx import Document
-    from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    src = fitz.open(pdf_path)
-    by_page = {}
-    for sec in matched:
-        by_page.setdefault(sec.page_index, []).append(sec)
-
-    docx = Document()
-    for st in docx.styles:
-        pass
-    normal = docx.styles["Normal"]
-    normal.font.name = "Times New Roman"
-    normal.font.size = Pt(11)
-
-    for pno in range(src.page_count):
-        page = src[pno]
-        text = page.get_text().strip()
-        if text:
-            for para in text.split("\n\n"):
-                p = docx.add_paragraph(para.strip())
-        # after this page's text, add any images whose section is on this page
-        for sec in by_page.get(pno, []):
-            art = sec.artwork
-            if not art or not art.image_path:
-                continue
-            ip = docx.add_paragraph()
-            ip.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = ip.add_run()
-            try:
-                run.add_picture(str(art.image_path), width=Inches(3.2))
-            except Exception:
-                continue
-            cap = docx.add_paragraph()
-            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            cr = cap.add_run((sec.note + " " if sec.note else "") + art.citation())
-            cr.italic = True
-            cr.font.size = Pt(8)
-            cr.font.color.rgb = RGBColor(0x40, 0x40, 0x40)
-    docx.save(str(docx_out))
-
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Illustrate any PDF with cited museum artwork.")
