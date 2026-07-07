@@ -239,19 +239,32 @@ def preview(job_id):
 
 @app.get("/api/pages/<job_id>")
 def pages(job_id):
-    """Render each page of the current PDF to a PNG (base64). Reliable preview
-    that displays in any browser, unlike an embedded cross-origin PDF."""
+    """Return the page COUNT only; images are fetched one at a time via
+    /api/page/<job>/<n>. Rendering all pages at once used too much memory on
+    the free tier and could crash the server mid-request."""
     job = JOBS.get(job_id)
     if not job or not job.get("pdf_bytes"):
         abort(404)
     doc = fitz.open(stream=job["pdf_bytes"], filetype="pdf")
-    out = []
-    for pg in doc:
-        pix = pg.get_pixmap(dpi=96)
-        out.append("data:image/png;base64," +
-                   base64.b64encode(pix.tobytes("png")).decode())
+    n = doc.page_count
     doc.close()
-    return jsonify(pages=out)
+    return jsonify(count=n)
+
+
+@app.get("/api/page/<job_id>/<int:n>")
+def page_image(job_id, n):
+    """Render a single page to PNG (base64). Low, steady memory use."""
+    job = JOBS.get(job_id)
+    if not job or not job.get("pdf_bytes"):
+        abort(404)
+    doc = fitz.open(stream=job["pdf_bytes"], filetype="pdf")
+    if n < 0 or n >= doc.page_count:
+        doc.close()
+        abort(404)
+    pix = doc[n].get_pixmap(dpi=90)
+    png = base64.b64encode(pix.tobytes("png")).decode()
+    doc.close()
+    return jsonify(page="data:image/png;base64," + png)
 
 
 if __name__ == "__main__":
