@@ -237,6 +237,23 @@ def preview(job_id):
                      download_name="preview.pdf")
 
 
+@app.get("/api/pages/<job_id>")
+def pages(job_id):
+    """Render each page of the current PDF to a PNG (base64). Reliable preview
+    that displays in any browser, unlike an embedded cross-origin PDF."""
+    job = JOBS.get(job_id)
+    if not job or not job.get("pdf_bytes"):
+        abort(404)
+    doc = fitz.open(stream=job["pdf_bytes"], filetype="pdf")
+    out = []
+    for pg in doc:
+        pix = pg.get_pixmap(dpi=96)
+        out.append("data:image/png;base64," +
+                   base64.b64encode(pix.tobytes("png")).decode())
+    doc.close()
+    return jsonify(pages=out)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
