@@ -467,8 +467,7 @@ def score_artwork(a, query, prefer):
 
 
 def find_artwork(section, clients, prefer, min_score, verbose, period="any"):
-    body = getattr(section, "_body", "") or ""
-    candidates = []
+    best = None
     for q in section.queries:
         results = []
         with ThreadPoolExecutor(max_workers=len(clients) or 1) as ex:
@@ -476,29 +475,13 @@ def find_artwork(section, clients, prefer, min_score, verbose, period="any"):
                 results.extend(arts)
         for art in results:
             if not _in_period(art, period):
-                if verbose:
-                    print(f"      [skip off-period] {art.museum}: {art.title[:55]}")
                 continue
             art.score = score_artwork(art, q, prefer)
-            candidates.append(art)
-        # gather enough to have fallbacks, then evaluate
-        if candidates:
-            candidates.sort(key=lambda a: a.score, reverse=True)
-            for art in candidates:
-                if art.score < min_score:
-                    break
-                # Confirm the top pick clearly relates; if not, try the next.
-                blurb = _relevance_blurb(body, art)
-                if blurb is None:
-                    if verbose:
-                        print(f"      [rejected: doesn't relate] {art.title[:55]}")
-                    continue
-                section.blurb = blurb
-                if verbose:
-                    print(f"      [{art.score:+.2f}] {art.museum}: {art.title[:60]}"
-                          + (f"  -- {blurb}" if blurb else ""))
-                return art
-    return None
+            if best is None or art.score > best.score:
+                best = art
+        if best and best.score >= min_score:
+            return best
+    return best if (best and best.score >= min_score) else None
 
 
 def download_image(art, session):
@@ -675,38 +658,40 @@ def _relevance_blurb(body, art):
 
 
 def _llm_query_batch(bodies, period, batch_size=8):
-    """Pick the best illustratable object for many passages using few Groq
-    calls (batch_size passages per call) instead of one call each. Returns a
-    list the same length as bodies, each a query string or None. Falls back to
-    None entries on failure so callers use the keyword method for those."""
+    """Pick the best illustratable object AND a one-line blurb for many passages
+    in few Groq calls. Returns a list of (query, blurb) tuples the same length as
+    bodies; entries are (None, "") on failure so callers fall back to keywords."""
     import os
     if not os.environ.get("GROQ_API_KEY") or not bodies:
-        return [None] * len(bodies)
+        return [(None, "")] * len(bodies)
     era = "" if period in ("any", None) else f" All passages are from the {period} period; prefer objects of that era."
-    out = [None] * len(bodies)
+    out = [(None, "")] * len(bodies)
     for start in range(0, len(bodies), batch_size):
         chunk = bodies[start:start + batch_size]
-        numbered = "\n\n".join(
-            f"[{i+1}] {b[:900]}" for i, b in enumerate(chunk))
+        numbered = "\n\n".join(f"[{i+1}] {b[:800]}" for i, b in enumerate(chunk))
         prompt = (
             "For each numbered passage, name the single most vivid physical "
-            "object, artwork, creature, structure, or artifact that a museum "
-            "would have a good image of." + era +
-            " Reply with one line per passage in the form:\n"
-            "N: <short museum search query, 2-5 words>\n"
-            "Use NONE if a passage has nothing concrete to depict. Reply with "
-            "ONLY these numbered lines.\n\n" + numbered)
-        text = _groq_chat(prompt, max_tokens=20 * len(chunk) + 20)
+            "object, artwork, creature, structure, or artifact a museum would "
+            "have a good image of, and write one short sentence saying how it "
+            "relates to the passage." + era +
+            " Reply one line per passage in EXACTLY this form:\n"
+            "N | <search query, 2-5 words> | <one-sentence blurb>\n"
+            "Use NONE as the query if a passage has nothing concrete. Reply with "
+            "ONLY these lines.\n\n" + numbered)
+        text = _groq_chat(prompt, max_tokens=60 * len(chunk) + 20)
         if not text:
             continue
         for line in text.splitlines():
-            m = re.match(r"\s*\[?(\d+)\]?[:.)]\s*(.+)", line.strip())
+            m = re.match(r"\s*\[?(\d+)\]?\s*[|:.)]\s*(.+)", line.strip())
             if not m:
                 continue
             idx = int(m.group(1)) - 1
-            val = m.group(2).strip().strip('".').strip()
-            if 0 <= idx < len(chunk) and val and val.upper() != "NONE" and len(val) <= 60:
-                out[start + idx] = val
+            rest = m.group(2)
+            parts = [x.strip() for x in rest.split("|")]
+            q = parts[0].strip('".').strip()
+            blurb = parts[1].strip() if len(parts) > 1 else ""
+            if 0 <= idx < len(chunk) and q and q.upper() != "NONE" and len(q) <= 60:
+                out[start + idx] = (q, blurb)
     return out
 
 
@@ -1181,6 +1166,19 @@ def cmd_build(args):
     print(f"\nSearching museum collections for {len(found)} section(s)...\n")
     searchable = [s for s in found if s.queries]
 
+    # One batched Groq pass: query + blurb per passage (fast, and gives blurbs).
+    bodies = [getattr(s, "_body", "") or "" for s in searchable]
+    picks = _llm_query_batch(bodies, period)
+    for sec, (pick, blurb) in zip(searchable, picks):
+        if pick:
+            q = pick
+            if period == "ancient" and "roman" not in q.lower() and "greek" not in q.lower():
+                q = f"roman {q}"
+            elif period not in ("any", None) and period != "ancient" and period not in q.lower():
+                q = f"{period} {q}"
+            sec.queries = [q] + [x for x in sec.queries if x != q]
+            sec.blurb = blurb or ""
+
     def _do(sec):
         return sec, find_artwork(sec, clients, prefer, args.min_score,
                                  args.verbose, period)
@@ -1252,21 +1250,18 @@ def decide_placements(pdf_path, config, min_score=0.35, verbose=True):
     found = [s for s in sections if s.page_index is not None]
     searchable = [s for s in found if s.queries]
 
-    # Groq object-picking, batched: a few calls for the whole document instead
-    # of one call per paragraph. Big speedup on long texts. Falls back to each
-    # section's keyword queries where the model returns nothing.
+    # One batched Groq pass gets both the search query and a blurb per passage.
     bodies = [getattr(s, "_body", "") or "" for s in searchable]
     picks = _llm_query_batch(bodies, period)
-    for sec, pick in zip(searchable, picks):
+    for sec, (pick, blurb) in zip(searchable, picks):
         if pick:
-            # phrase with period like _object_queries does, then keep keyword
-            # queries as fallbacks after the AI pick
             q = pick
             if period == "ancient" and "roman" not in q.lower() and "greek" not in q.lower():
                 q = f"roman {q}"
             elif period not in ("any", None) and period != "ancient" and period not in q.lower():
                 q = f"{period} {q}"
             sec.queries = [q] + [x for x in sec.queries if x != q]
+            sec.blurb = blurb or ""
 
     def _do(sec):
         return sec, find_artwork(sec, clients, prefer, min_score, verbose, period)
