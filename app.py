@@ -21,8 +21,10 @@ Deploy:        see README_DEPLOY.md
 import base64
 import io
 import os
+import json
 import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import fitz
@@ -32,10 +34,9 @@ from flask_cors import CORS
 import museum_illustrator as mi
 
 app = Flask(__name__)
-# Lock this down to your Netlify origin in production via ALLOWED_ORIGIN.
 CORS(app, origins=os.environ.get("ALLOWED_ORIGIN", "*"))
 
-JOBS = {}  # job_id -> dict(state, log, done, error, pdf_bytes)
+JOBS = {}  # job_id -> dict
 
 
 def _keys_from_env(args):
@@ -81,28 +82,17 @@ def _run_build(job_id, pdf_bytes, config, min_score):
 
     import contextlib
     tmp_in = f"/tmp/{job_id}_in.pdf"
-    tmp_cfg = f"/tmp/{job_id}.json"
-    tmp_out = f"/tmp/{job_id}_out.pdf"
     try:
         with open(tmp_in, "wb") as f:
             f.write(pdf_bytes)
-        import json
-        with open(tmp_cfg, "w") as f:
-            json.dump(config, f)
-
-        args = SimpleNamespace(
-            pdf=__import__("pathlib").Path(tmp_in),
-            config=__import__("pathlib").Path(tmp_cfg),
-            output=__import__("pathlib").Path(tmp_out),
-            min_score=min_score, list=False, verbose=True)
-        _keys_from_env(args)
-
+        job["pdf_path"] = tmp_in
+        job["config"] = config
         job["state"] = "running"
         with contextlib.redirect_stdout(Tee()):
-            mi.cmd_build(args)
-
-        with open(tmp_out, "rb") as f:
-            job["pdf_bytes"] = f.read()
+            placements = mi.decide_placements(tmp_in, config, min_score=min_score)
+        job["placements"] = placements
+        # render the initial PDF
+        _render_job(job_id)
         job["state"] = "done"
         job["done"] = True
     except SystemExit as e:
@@ -111,12 +101,18 @@ def _run_build(job_id, pdf_bytes, config, min_score):
     except Exception as e:
         job["error"] = f"{type(e).__name__}: {e}"
         job["state"] = "error"
-    finally:
-        for p in (tmp_in, tmp_cfg, tmp_out):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+
+
+def _render_job(job_id):
+    job = JOBS[job_id]
+    out = f"/tmp/{job_id}_out.pdf"
+    mi.render_from_placements(job["pdf_path"], job["placements"], out)
+    with open(out, "rb") as f:
+        job["pdf_bytes"] = f.read()
+    try:
+        os.remove(out)
+    except OSError:
+        pass
 
 
 @app.post("/api/build")
@@ -127,8 +123,8 @@ def build():
     min_score = float(body.get("min_score", 0.35))
     filename = body.get("filename", "illustrated.pdf")
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"state": "queued", "log": [], "done": False,
-                    "error": None, "pdf_bytes": None, "filename": filename}
+    JOBS[job_id] = {"state": "queued", "log": [], "done": False, "error": None,
+                    "pdf_bytes": None, "filename": filename, "placements": []}
     threading.Thread(target=_run_build,
                      args=(job_id, pdf_bytes, config, min_score),
                      daemon=True).start()
@@ -144,10 +140,83 @@ def status(job_id):
                    done=job["done"], error=job["error"])
 
 
+def _placements_public(job):
+    """Placement info safe to send to the browser (no local file paths)."""
+    out = []
+    for i, p in enumerate(job["placements"]):
+        out.append({
+            "index": i, "page": p["page"] + 1, "title": p["title"],
+            "maker": p["maker"], "date": p["date"], "museum": p["museum"],
+            "blurb": p.get("blurb", ""), "removed": p.get("removed", False),
+            "citation": _cite(p),
+        })
+    return out
+
+
+def _cite(p):
+    bits = [p["title"]]
+    for x in (p["maker"], p["date"], p["medium"]):
+        if x:
+            bits.append(x)
+    head = ". ".join(b for b in bits if b)
+    return f"{head}. {p['museum']}, {p['accession']}. {p['license']}."
+
+
+@app.get("/api/placements/<job_id>")
+def placements(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+    return jsonify(placements=_placements_public(job))
+
+
+@app.post("/api/edit/<job_id>")
+def edit(job_id):
+    """Queue-free single edit: remove or replace one image. The browser calls
+    this per edit while the user works; the PDF is only re-rendered on /done."""
+    job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+    body = request.get_json(force=True)
+    idx = int(body.get("index", -1))
+    action = body.get("action")
+    if idx < 0 or idx >= len(job["placements"]):
+        abort(400, "bad index")
+    p = job["placements"][idx]
+    if action == "remove":
+        p["removed"] = True
+        return jsonify(ok=True, removed=True)
+    if action == "restore":
+        p["removed"] = False
+        return jsonify(ok=True, removed=False)
+    if action == "replace":
+        desc = (body.get("description") or "").strip()
+        if not desc:
+            abort(400, "no description")
+        period = job.get("config", {}).get("period", "any")
+        ok = mi.replace_placement(p, desc, period)
+        return jsonify(ok=ok, citation=_cite(p) if ok else None,
+                       blurb=p.get("blurb", "") if ok else None)
+    abort(400, "unknown action")
+
+
+@app.post("/api/done/<job_id>")
+def done(job_id):
+    """Re-render the PDF with all queued edits applied."""
+    job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+    try:
+        _render_job(job_id)
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.get("/api/result/<job_id>")
 def result(job_id):
     job = JOBS.get(job_id)
-    if not job or not job["pdf_bytes"]:
+    if not job or not job.get("pdf_bytes"):
         abort(404)
     name = job.get("filename") or "illustrated.pdf"
     if not name.lower().endswith(".pdf"):
@@ -157,6 +226,18 @@ def result(job_id):
                      download_name=name)
 
 
+@app.get("/api/preview/<job_id>")
+def preview(job_id):
+    """Inline PDF for the embedded viewer (not an attachment)."""
+    job = JOBS.get(job_id)
+    if not job or not job.get("pdf_bytes"):
+        abort(404)
+    return send_file(io.BytesIO(job["pdf_bytes"]),
+                     mimetype="application/pdf", as_attachment=False,
+                     download_name="preview.pdf")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+

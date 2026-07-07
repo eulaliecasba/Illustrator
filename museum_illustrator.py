@@ -37,6 +37,8 @@ import hashlib
 import json
 import re
 import sys
+import os
+from types import SimpleNamespace
 import time
 import unicodedata
 from collections import Counter
@@ -89,6 +91,7 @@ class Section:
     note: str = ""
     page_index: int | None = None
     artwork: Artwork | None = None
+    blurb: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -464,27 +467,38 @@ def score_artwork(a, query, prefer):
 
 
 def find_artwork(section, clients, prefer, min_score, verbose, period="any"):
-    best = None
+    body = getattr(section, "_body", "") or ""
+    candidates = []
     for q in section.queries:
         results = []
         with ThreadPoolExecutor(max_workers=len(clients) or 1) as ex:
             for arts in ex.map(lambda c: c.search(q), clients):
                 results.extend(arts)
         for art in results:
-            # Period gate: skip anything outside the document's era.
             if not _in_period(art, period):
                 if verbose:
                     print(f"      [skip off-period] {art.museum}: {art.title[:55]}")
                 continue
             art.score = score_artwork(art, q, prefer)
-            if verbose:
-                print(f"      [{art.score:+.2f}] {art.museum}: {art.title[:70]}")
-            if best is None or art.score > best.score:
-                best = art
-        if best and best.score >= min_score:
-            return best
-    # Nothing in-period cleared the bar -> skip the section.
-    return best if (best and best.score >= min_score) else None
+            candidates.append(art)
+        # gather enough to have fallbacks, then evaluate
+        if candidates:
+            candidates.sort(key=lambda a: a.score, reverse=True)
+            for art in candidates:
+                if art.score < min_score:
+                    break
+                # Confirm the top pick clearly relates; if not, try the next.
+                blurb = _relevance_blurb(body, art)
+                if blurb is None:
+                    if verbose:
+                        print(f"      [rejected: doesn't relate] {art.title[:55]}")
+                    continue
+                section.blurb = blurb
+                if verbose:
+                    print(f"      [{art.score:+.2f}] {art.museum}: {art.title[:60]}"
+                          + (f"  -- {blurb}" if blurb else ""))
+                return art
+    return None
 
 
 def download_image(art, session):
@@ -593,14 +607,35 @@ _OBJECT_VOCAB = [
 ]
 
 
-def _llm_query(body, period):
-    """Ask an LLM (Groq, free tier) to name the single best illustratable object
-    in this passage and return a museum search query, or None. Returns None on
-    any failure so the caller falls back to the keyword method. Requires
-    GROQ_API_KEY."""
+def _groq_chat(prompt, max_tokens=40):
+    """Single shared Groq call. Returns stripped text, or None on failure/no key."""
     import os
     key = os.environ.get("GROQ_API_KEY")
     if not key:
+        return None
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {"model": "llama-3.1-8b-instant",
+               "messages": [{"role": "user", "content": prompt}],
+               "temperature": 0.2, "max_tokens": max_tokens}
+    try:
+        time.sleep(REQUEST_PAUSE)
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        if r.status_code == 429:  # rate limited
+            time.sleep(2.0)
+            r = requests.post(url, headers=headers, json=payload, timeout=25)
+        r.raise_for_status()
+        text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+        return text.strip().strip('".').strip()
+    except Exception:
+        return None
+
+
+def _llm_query(body, period):
+    """Ask Groq for the single best illustratable object as a search query, or
+    None (fall back to keyword method / skip). Requires GROQ_API_KEY."""
+    import os
+    if not os.environ.get("GROQ_API_KEY"):
         return None
     era = "" if period in ("any", None) else f" The text is from the {period} period; prefer an object of that era."
     prompt = (
@@ -611,27 +646,32 @@ def _llm_query(body, period):
         " Reply with ONLY a short museum search query (2-5 words, in English), or "
         "the single word NONE if the passage describes nothing concrete and "
         "depictable. No explanation.\n\nPassage:\n" + body[:1500])
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2, "max_tokens": 20,
-    }
-    try:
-        time.sleep(REQUEST_PAUSE)
-        r = requests.post(url, headers=headers, json=payload, timeout=25)
-        if r.status_code == 429:  # rate limited
-            time.sleep(2.0)
-            r = requests.post(url, headers=headers, json=payload, timeout=25)
-        r.raise_for_status()
-        text = (r.json()["choices"][0]["message"]["content"] or "").strip()
-        text = text.strip().strip('".').strip()
-        if not text or text.upper() == "NONE" or len(text) > 60:
-            return None
-        return text
-    except Exception:
+    text = _groq_chat(prompt, max_tokens=20)
+    if not text or text.upper() == "NONE" or len(text) > 60:
         return None
+    return text
+
+
+def _relevance_blurb(body, art):
+    """Judge whether the artwork clearly relates to the passage. Returns a short
+    blurb if it does, None if it doesn't (reject), or "" if no key (accept)."""
+    import os
+    if not os.environ.get("GROQ_API_KEY"):
+        return ""  # can't judge; accept the best available match
+    obj = f"{art.title}. {art.maker}. {art.date}. {art.medium}".strip()
+    prompt = (
+        "A passage will be illustrated with a museum object. Decide if the object "
+        "CLEARLY relates to something specific in the passage.\n"
+        "If yes: reply with one short sentence (max 20 words) stating how the "
+        "object relates to a specific element in the passage.\n"
+        "If it does not clearly relate, reply with exactly: NO\n\n"
+        f"Object: {obj}\n\nPassage:\n{body[:1200]}")
+    text = _groq_chat(prompt, max_tokens=40)
+    if text is None:
+        return ""  # call failed -> don't block the image
+    if not text or text.upper().startswith("NO"):
+        return None
+    return text
 
 
 def _object_queries(body, period="any"):
@@ -766,6 +806,7 @@ def scan_pdf(pdf_path, max_marker_words=12, period="any"):
                 "note": "",
                 "queries": queries,
                 "page": pno,
+                "body": body[:1200],
             })
             page_done = True
     return sections
@@ -797,9 +838,12 @@ def write_starter_config(pdf_path, out_path, prefer):
 
 def load_sections(path):
     raw = json.loads(path.read_text(encoding="utf-8"))
-    secs = [Section(sid=d["id"], marker=d["marker"], queries=d.get("queries", []),
+    secs = []
+    for d in raw["sections"]:
+        s = Section(sid=d["id"], marker=d["marker"], queries=d.get("queries", []),
                     note=d.get("note", ""), page_index=d.get("page"))
-            for d in raw["sections"]]
+        s._body = d.get("body", "")
+        secs.append(s)
     return secs, raw.get("prefer", []), raw.get("period", "any")
 
 
@@ -856,6 +900,8 @@ def _find_gaps(page, margin=54):
 
 def _caption_lines(art, sec):
     parts = []
+    if getattr(sec, "blurb", ""):
+        parts.append(sec.blurb)
     if sec.note:
         parts.append(sec.note)
     parts.append(art.citation())
@@ -863,7 +909,7 @@ def _caption_lines(art, sec):
 
 
 # Sizing targets (points).
-CAPTION_H = 46          # room for a full multi-line citation
+CAPTION_H = 62          # room for a relevance blurb + full citation
 MIN_IMG_H = 70          # smallest image we'll shrink to before spilling
 MAX_IMG_H = 300         # cap so a tall image doesn't dominate
 TARGET_IMG_W_FRAC = 0.62  # aim for ~62% of the text column width
@@ -1141,6 +1187,137 @@ def cmd_build(args):
         placed.append((i + 1, sec))
     doc.save(out, deflate=True)
     print(f"\nWrote {out}  ({len(placed)} images placed).")
+
+
+# --------------------------------------------------------------------------
+# API-facing build: separates "decide placements" from "render PDF", so the
+# web layer can let users remove/replace individual images and re-render.
+# --------------------------------------------------------------------------
+
+def decide_placements(pdf_path, config, min_score=0.35, verbose=True):
+    """Run the full search/selection and return a list of placement dicts:
+      {sid, page, marker, blurb, title, maker, date, medium, museum,
+       accession, object_url, image_url, license, image_path}
+    Does not render a PDF. This is what the preview/edit layer works from."""
+    sections, prefer, period = load_sections_from_dict(config)
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
+    args = SimpleNamespace(rijks_key=os.environ.get("RIJKS_API_KEY"),
+                           smithsonian_key=os.environ.get("SMITHSONIAN_API_KEY"),
+                           harvard_key=os.environ.get("HARVARD_API_KEY"))
+    clients = build_clients(session, args)
+
+    doc = fitz.open(pdf_path)
+    locate_sections(doc, sections)
+    found = [s for s in sections if s.page_index is not None]
+    searchable = [s for s in found if s.queries]
+
+    def _do(sec):
+        return sec, find_artwork(sec, clients, prefer, min_score, verbose, period)
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(searchable)))) as ex:
+        for sec, art in ex.map(_do, searchable):
+            results[id(sec)] = art
+
+    used, chosen = set(), []
+    for sec in sorted(searchable, key=lambda s: (s.page_index, s.sid)):
+        art = results.get(id(sec))
+        if art is None or art.image_url in used:
+            continue
+        used.add(art.image_url)
+        sec.artwork = art
+        chosen.append(sec)
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(chosen)))) as ex:
+        list(ex.map(lambda s: download_image(s.artwork, session), chosen))
+    chosen = [s for s in chosen if s.artwork.image_path]
+
+    placements = []
+    for sec in chosen:
+        a = sec.artwork
+        placements.append({
+            "sid": sec.sid, "page": sec.page_index, "marker": sec.marker,
+            "blurb": getattr(sec, "blurb", ""), "body": getattr(sec, "_body", ""),
+            "title": a.title, "maker": a.maker, "date": a.date, "medium": a.medium,
+            "museum": a.museum, "accession": a.accession,
+            "object_url": a.object_url, "image_url": a.image_url,
+            "license": a.license, "image_path": str(a.image_path),
+            "removed": False,
+        })
+    return placements
+
+
+def load_sections_from_dict(config):
+    """Like load_sections but from an in-memory dict (no file)."""
+    secs = []
+    for d in config.get("sections", []):
+        s = Section(sid=d["id"], marker=d["marker"], queries=d.get("queries", []),
+                    note=d.get("note", ""), page_index=d.get("page"))
+        s._body = d.get("body", "")
+        secs.append(s)
+    return secs, config.get("prefer", []), config.get("period", "any")
+
+
+def _placement_to_section(p):
+    """Rebuild a Section+Artwork from a placement dict for rendering."""
+    sec = Section(sid=p["sid"], marker=p["marker"], queries=[],
+                  page_index=p["page"], note="")
+    sec.blurb = p.get("blurb", "")
+    sec.artwork = Artwork(
+        museum=p["museum"], title=p["title"], maker=p["maker"], date=p["date"],
+        medium=p["medium"], accession=p["accession"], object_url=p["object_url"],
+        image_url=p["image_url"], license=p["license"])
+    sec.artwork.image_path = Path(p["image_path"])
+    return sec
+
+
+def render_from_placements(pdf_path, placements, out_path):
+    """Render the illustrated PDF from a (possibly edited) placements list."""
+    doc = fitz.open(pdf_path)
+    active = [p for p in placements if not p.get("removed") and p.get("image_path")]
+    secs = [_placement_to_section(p) for p in active]
+    secs.sort(key=lambda s: s.page_index)
+    spill_offset = 0
+    for i, sec in enumerate(secs):
+        added = insert_plate(doc, sec.page_index + spill_offset, sec, i + 1)
+        if added:
+            spill_offset += 1
+    doc.save(out_path, deflate=True)
+    return len([p for p in active])
+
+
+def replace_placement(placement, description, period="any"):
+    """Search for a new image matching the user's description and update the
+    placement in place. Returns True if a replacement was found."""
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
+    args = SimpleNamespace(rijks_key=os.environ.get("RIJKS_API_KEY"),
+                           smithsonian_key=os.environ.get("SMITHSONIAN_API_KEY"),
+                           harvard_key=os.environ.get("HARVARD_API_KEY"))
+    clients = build_clients(session, args)
+    q = description.strip()
+    results = []
+    with ThreadPoolExecutor(max_workers=len(clients) or 1) as ex:
+        for arts in ex.map(lambda c: c.search(q), clients):
+            results.extend(arts)
+    results = [a for a in results if _in_period(a, period)]
+    if not results:
+        return False
+    for a in results:
+        a.score = score_artwork(a, q, [])
+    results.sort(key=lambda a: a.score, reverse=True)
+    art = results[0]
+    if not download_image(art, session):
+        return False
+    placement.update({
+        "title": art.title, "maker": art.maker, "date": art.date,
+        "medium": art.medium, "museum": art.museum, "accession": art.accession,
+        "object_url": art.object_url, "image_url": art.image_url,
+        "license": art.license, "image_path": str(art.image_path),
+        "blurb": f"Selected to match: {description}", "removed": False,
+    })
+    return True
 
 
 def main(argv=None):
