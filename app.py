@@ -113,6 +113,10 @@ def _render_job(job_id):
         os.remove(out)
     except OSError:
         pass
+    # Release memory: drop image caches and force a collection so a long
+    # document doesn't push the 512MB free instance over its limit.
+    import gc
+    gc.collect()
 
 
 @app.post("/api/build")

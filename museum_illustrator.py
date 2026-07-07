@@ -1187,7 +1187,7 @@ def cmd_build(args):
 
     # Search all sections concurrently.
     results = {}
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(searchable)))) as ex:
+    with ThreadPoolExecutor(max_workers=min(3, max(1, len(searchable)))) as ex:
         for sec, art in ex.map(_do, searchable):
             results[id(sec)] = art
 
@@ -1214,7 +1214,7 @@ def cmd_build(args):
         return
 
     # Download all chosen images concurrently.
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(matched)))) as ex:
+    with ThreadPoolExecutor(max_workers=min(3, max(1, len(matched)))) as ex:
         list(ex.map(lambda s: download_image(s.artwork, session), matched))
     matched = [s for s in matched if s.artwork.image_path]
     matched.sort(key=lambda s: s.page_index)
@@ -1272,7 +1272,7 @@ def decide_placements(pdf_path, config, min_score=0.35, verbose=True):
         return sec, find_artwork(sec, clients, prefer, min_score, verbose, period)
 
     results = {}
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(searchable)))) as ex:
+    with ThreadPoolExecutor(max_workers=min(3, max(1, len(searchable)))) as ex:
         for sec, art in ex.map(_do, searchable):
             results[id(sec)] = art
 
@@ -1285,7 +1285,7 @@ def decide_placements(pdf_path, config, min_score=0.35, verbose=True):
         sec.artwork = art
         chosen.append(sec)
 
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(chosen)))) as ex:
+    with ThreadPoolExecutor(max_workers=min(3, max(1, len(chosen)))) as ex:
         list(ex.map(lambda s: download_image(s.artwork, session), chosen))
     chosen = [s for s in chosen if s.artwork.image_path]
 
