@@ -661,69 +661,174 @@ def _relevance_blurb(body, art):
     return text
 
 
-def _llm_query_batch(bodies, period, batch_size=12):
-    """For each passage, identify (a) the single most vivid physical object a
-    museum would have a good image of, (b) the exact sentence from the passage
-    that refers to it, and (c) the exact word/phrase inside that sentence that
-    names it. Returns a list of (query, sentence, term) tuples, one per body.
+def _keyword_term_from_body(body):
+    """Fallback used when the LLM didn't identify a term (no key, rate limit,
+    or malformed reply). Look for a stem from the curated Latin vocabulary in
+    the passage; if one matches, return (museum query, the actual word from
+    the passage that matched). Returns None if nothing matches."""
+    if not body:
+        return None
+    low = _norm(body)
+    # Latin case endings that may follow a stem. Kept short so 'canis' does
+    # not accidentally match 'canistella' (little baskets, unrelated to dogs).
+    tail = r"(?:a|ae|am|as|e|em|es|i|is|ibus|o|os|orum|arum|um|us|u)?"
+    for stems, query in _OBJECT_VOCAB:
+        for stem in stems:
+            stem_n = _norm(stem).rstrip()
+            if not stem_n:
+                continue
+            pat = r"(?:^|[^a-z])(" + re.escape(stem_n) + tail + r")(?![a-z])"
+            m = re.search(pat, low)
+            if not m:
+                continue
+            start = m.start(1)
+            end = m.end(1)
+            if len(low) == len(body):
+                word = body[start:end]
+            else:
+                word = stem.rstrip()
+            return (query, word)
+    return None
 
-    If the passage contains nothing concrete and depictable, or the LLM can't
-    pin the object to a specific sentence-and-word, the entry is (None, "", "")
-    and the caller should skip the section entirely (no image).
 
-    Uses a batched call so long PDFs stay fast. Requires GROQ_API_KEY."""
+def _find_sentence_with_term(body, term):
+    """Locate the sentence in `body` that contains `term`. Returns the
+    sentence as it appears in the original body (with diacritics), or "" if
+    the term isn't in the passage. Case- and diacritic-insensitive match."""
+    if not body or not term:
+        return ""
+    term_n = _norm(term)
+    body_n = _norm(body)
+    pos = body_n.find(term_n)
+    if pos < 0:
+        return ""
+    # Walk back to a sentence boundary (or start of body).
+    start = 0
+    for i in range(pos - 1, -1, -1):
+        if body[i] in ".!?\n":
+            start = i + 1
+            break
+    # Walk forward to the next sentence boundary.
+    end = len(body)
+    for i in range(pos + len(term), len(body)):
+        if body[i] in ".!?":
+            end = i + 1
+            break
+        if body[i] == "\n" and i - pos > 20:
+            end = i
+            break
+    sentence = body[start:end].strip()
+    # Trim if it's still absurdly long (multi-sentence run-on).
+    if len(sentence) > 260:
+        sentence = sentence[:260].rsplit(" ", 1)[0] + "…"
+    return sentence
+
+
+def _llm_query_batch(bodies, period, batch_size=10):
+    """For each passage, identify (a) a museum search query and (b) the exact
+    word/phrase in the passage that names the depicted object. Returns a list
+    of (query, term) tuples, one per body; entries are (None, "") when the
+    LLM couldn't pin anything concrete. The referring sentence is derived
+    locally from the passage using the term, so we don't need the LLM to
+    quote it back verbatim (which it often gets wrong).
+
+    Requires GROQ_API_KEY; without one, returns all (None, "")."""
     import os
     if not os.environ.get("GROQ_API_KEY") or not bodies:
-        return [(None, "", "")] * len(bodies)
+        return [(None, "")] * len(bodies)
     era = "" if period in ("any", None) else f" All passages are from the {period} period; prefer objects of that era."
-    out = [(None, "", "")] * len(bodies)
+    out = [(None, "")] * len(bodies)
     for start in range(0, len(bodies), batch_size):
         chunk = bodies[start:start + batch_size]
         numbered = "\n\n".join(f"[{i+1}] {b[:900]}" for i, b in enumerate(chunk))
         prompt = (
-            "For each numbered passage, identify the single most vivid physical "
-            "object, creature, artifact, or structure that a museum would have a "
-            "good image of AND that is named by a specific word or phrase in the "
-            "passage." + era + "\n\n"
-            "Reply one line per passage in EXACTLY this pipe-delimited form:\n"
-            "N | <museum search query, 2-5 English words> | <the exact sentence from the passage that mentions the object, copied verbatim> | <the exact word or short phrase from that sentence that names the object, copied verbatim>\n\n"
+            "For each numbered passage below, identify one concrete physical "
+            "object, creature, artifact, or structure NAMED BY A SPECIFIC WORD "
+            "in the passage that a museum would have a good image of." + era + "\n\n"
+            "Reply with one line per passage in EXACTLY this form:\n"
+            "N || <museum search query, 2-5 English words> || <the exact word or short phrase from the passage that names the object>\n\n"
             "Rules:\n"
-            "- The sentence and word MUST be copied verbatim from the passage, preserving original spelling and diacritics.\n"
-            "- The word must appear inside the sentence you chose.\n"
-            "- If the passage contains nothing concrete and depictable, or you cannot pin the object to a specific word in a specific sentence, reply: N | NONE | | \n"
-            "- Reply with ONLY these lines, one per passage, no preamble.\n\n"
+            "- The word MUST be copied verbatim from the passage, preserving spelling and diacritics.\n"
+            "- If a passage names nothing concrete and depictable, reply: N || NONE || \n"
+            "- Reply with ONLY the numbered lines, one per passage, no preamble or explanation.\n\n"
             + numbered)
-        text = _groq_chat(prompt, max_tokens=180 * len(chunk) + 40)
+        text = _groq_chat(prompt, max_tokens=80 * len(chunk) + 40)
         if not text:
             continue
-        for line in text.splitlines():
-            m = re.match(r"\s*\[?(\d+)\]?\s*[|:.)]\s*(.+)", line.strip())
-            if not m:
-                continue
-            idx = int(m.group(1)) - 1
-            if not (0 <= idx < len(chunk)):
-                continue
-            parts = [x.strip() for x in m.group(2).split("|")]
-            if len(parts) < 3:
-                continue
-            q = parts[0].strip('"\u201c\u201d.').strip()
-            sentence = parts[1].strip().strip('"\u201c\u201d').strip()
-            term = parts[2].strip().strip('"\u201c\u201d.,;:').strip()
-            if not q or q.upper() == "NONE" or len(q) > 60:
-                continue
-            if not sentence or not term:
-                continue
-            # Verify the sentence and word are actually in the passage (so we
-            # never bold a hallucinated word). Case- and diacritic-insensitive.
-            body_norm = _norm(chunk[idx])
-            if _norm(term) not in body_norm:
-                continue
-            if _norm(sentence[:60]) not in body_norm:
-                # sentence not verifiable; still accept if term is present, but
-                # fall back to a locally-derived sentence at render time
-                sentence = ""
-            out[start + idx] = (q, sentence, term)
+        _parse_batch_lines(text, chunk, out, start)
+    # Retry any passages the batched call didn't resolve, one at a time.
+    for i, (q, term) in enumerate(out):
+        if q is None and bodies[i]:
+            out[i] = _llm_query_single(bodies[i], period)
+    # Finally, verify each term is actually in its passage.
+    for i, (q, term) in enumerate(out):
+        if term and _norm(term) not in _norm(bodies[i]):
+            out[i] = (None, "")
     return out
+
+
+def _parse_batch_lines(text, chunk, out, start):
+    """Extract 'N || query || term' lines from `text` into `out[start:]`.
+    Accepts several delimiters ('||', '|', tab) and is tolerant of missing
+    leading numbers when the LLM produces a plain numbered list."""
+    for lineno, raw in enumerate(text.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"\s*\[?(\d+)\]?\s*[|:.)\]]\s*(.+)", line)
+        if m:
+            idx = int(m.group(1)) - 1
+            rest = m.group(2)
+        else:
+            # No leading number: fall back to line order within the chunk.
+            idx = lineno
+            rest = line
+        if not (0 <= idx < len(chunk)):
+            continue
+        # Prefer '||' as delimiter; fall back to single '|' or tab.
+        if "||" in rest:
+            parts = [x.strip() for x in rest.split("||")]
+        elif "\t" in rest:
+            parts = [x.strip() for x in rest.split("\t")]
+        else:
+            parts = [x.strip() for x in rest.split("|")]
+        parts = [p for p in parts if p]
+        if len(parts) < 2:
+            continue
+        q = parts[0].strip('"\u201c\u201d.').strip()
+        term = parts[-1].strip().strip('"\u201c\u201d.,;:').strip()
+        if not q or q.upper() == "NONE" or len(q) > 60 or not term or len(term) > 80:
+            continue
+        out[start + idx] = (q, term)
+
+
+def _llm_query_single(body, period):
+    """One-passage fallback used when the batched call skipped a passage."""
+    era = "" if period in ("any", None) else f" The passage is from the {period} period; prefer an object of that era."
+    prompt = (
+        "Read the passage below. Identify one concrete physical object, "
+        "creature, or artifact NAMED BY A SPECIFIC WORD in the passage that a "
+        "museum would have a good image of." + era + "\n\n"
+        "Reply on ONE line in EXACTLY this form:\n"
+        "<museum search query, 2-5 English words> || <the exact word from the passage that names it>\n\n"
+        "If nothing concrete is named, reply: NONE\n\n"
+        "Passage:\n" + body[:1200])
+    text = _groq_chat(prompt, max_tokens=60)
+    if not text or text.strip().upper().startswith("NONE"):
+        return (None, "")
+    line = text.strip().splitlines()[0]
+    if "||" in line:
+        parts = [x.strip() for x in line.split("||")]
+    else:
+        parts = [x.strip() for x in line.split("|")]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return (None, "")
+    q = parts[0].strip('"\u201c\u201d.').strip()
+    term = parts[-1].strip().strip('"\u201c\u201d.,;:').strip()
+    if not q or q.upper() == "NONE" or not term:
+        return (None, "")
+    return (q, term)
 
 
 def _object_queries(body, period="any", use_llm=True):
@@ -1238,16 +1343,22 @@ def cmd_build(args):
     print(f"\nSearching museum collections for {len(found)} section(s)...\n")
     candidates = [s for s in found if s.queries]
 
-    # One batched Groq pass returns, for each passage: (search query, the exact
-    # sentence in the passage that refers to a concrete object, the exact word
-    # inside that sentence naming it). Sections without a specific referring
-    # word are dropped -- we don't illustrate what the text doesn't name.
+    # One batched Groq pass returns (search query, exact word from passage)
+    # per passage. We derive the enclosing sentence locally from the passage.
+    # Sections without a specific referring word are dropped -- we don't
+    # illustrate what the text doesn't name.
     bodies = [getattr(s, "_body", "") or "" for s in candidates]
     picks = _llm_query_batch(bodies, period)
     searchable = []
-    for sec, (pick, sentence, term) in zip(candidates, picks):
+    for sec, body, (pick, term) in zip(candidates, bodies, picks):
+        # Fallback: if the LLM didn't pin a word, use the curated Latin
+        # vocabulary. Find the first stem that matches in the body and take
+        # the actual matching word from the passage as the term.
+        if (not pick or not term) and body:
+            fallback = _keyword_term_from_body(body)
+            if fallback:
+                pick, term = fallback
         if not pick or not term:
-            # No specific concrete referent -> no image for this passage.
             continue
         q = pick
         if period == "ancient" and "roman" not in q.lower() and "greek" not in q.lower():
@@ -1255,9 +1366,24 @@ def cmd_build(args):
         elif period not in ("any", None) and period != "ancient" and period not in q.lower():
             q = f"{period} {q}"
         sec.queries = [q] + [x for x in sec.queries if x != q]
-        sec.blurb = sentence or ""
+        sec.blurb = _find_sentence_with_term(body, term)
         sec.blurb_bold = term
         searchable.append(sec)
+
+    if not searchable:
+        sys.exit("No passages named a specific illustratable object; nothing to do.")
+
+    def _do(sec):
+        return sec, find_artwork(sec, clients, prefer, args.min_score,
+                                 args.verbose, period)
+
+    # Search all sections concurrently. Workers scale with the number of
+    # sections rather than being capped at 3; each worker does a short burst of
+    # museum HTTP calls, so 8 in parallel is comfortable on the free tier.
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(searchable)))) as ex:
+        for sec, art in ex.map(_do, searchable):
+            results[id(sec)] = art
 
     if not searchable:
         sys.exit("No passages named a specific illustratable object; nothing to do.")
