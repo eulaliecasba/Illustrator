@@ -32,6 +32,15 @@ app = Flask(__name__)
 CORS(app, origins=os.environ.get("ALLOWED_ORIGIN", "*"))
 
 JOBS = {}
+UPLOADS = {}  # pdf_id -> {"bytes": ..., "ts": ...}
+UPLOAD_TTL = 30 * 60  # 30 min
+
+def _gc_uploads():
+    import time
+    now = time.time()
+    stale = [k for k, v in UPLOADS.items() if now - v["ts"] > UPLOAD_TTL]
+    for k in stale:
+        UPLOADS.pop(k, None)
 
 
 def _keys_from_env(args):
@@ -48,6 +57,8 @@ def health():
 
 @app.post("/api/scan")
 def scan():
+    import time
+    _gc_uploads()
     if "pdf" not in request.files:
         abort(400, "no pdf uploaded")
     data = request.files["pdf"].read()
@@ -60,7 +71,13 @@ def scan():
     finally:
         os.remove(tmp)
     prefer = [p for p in request.form.get("prefer", "").split(",") if p.strip()]
-    return jsonify(config={"prefer": prefer, "sections": sections})
+    # Cache the PDF so build/ doesn't need it re-uploaded (base64-encoding the
+    # same file client-side and shipping it a second time is usually the
+    # slowest step of the whole run).
+    pdf_id = uuid.uuid4().hex
+    UPLOADS[pdf_id] = {"bytes": data, "ts": time.time()}
+    return jsonify(pdf_id=pdf_id,
+                   config={"prefer": prefer, "sections": sections})
 
 
 def _run_build(job_id, pdf_bytes, config, min_score):
@@ -114,7 +131,13 @@ def _run_build(job_id, pdf_bytes, config, min_score):
 @app.post("/api/build")
 def build():
     body = request.get_json(force=True)
-    pdf_bytes = base64.b64decode(body["pdf_b64"])
+    pdf_id = body.get("pdf_id")
+    if pdf_id and pdf_id in UPLOADS:
+        pdf_bytes = UPLOADS.pop(pdf_id)["bytes"]  # one-shot
+    elif body.get("pdf_b64"):
+        pdf_bytes = base64.b64decode(body["pdf_b64"])
+    else:
+        abort(400, "no pdf provided")
     config = body["config"]
     min_score = float(body.get("min_score", 0.35))
     filename = body.get("filename", "illustrated.pdf")

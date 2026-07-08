@@ -51,7 +51,7 @@ import requests
 
 USER_AGENT = "MuseumIllustrator/1.1 (personal scholarly project)"
 CACHE_DIR = Path(".artwork_cache")
-REQUEST_PAUSE = 0.05
+REQUEST_PAUSE = 0.0
 EXCLUDE_TERMS = ("photograph", "postcard", "reproduction print", "sample book")
 
 
@@ -91,7 +91,8 @@ class Section:
     note: str = ""
     page_index: int | None = None
     artwork: Artwork | None = None
-    blurb: str = ""
+    blurb: str = ""            # the specific Latin sentence
+    blurb_bold: str = ""       # the exact word inside the sentence to embolden
 
 
 # --------------------------------------------------------------------------
@@ -467,8 +468,11 @@ def score_artwork(a, query, prefer):
 
 
 def find_artwork(section, clients, prefer, min_score, verbose, period="any"):
+    # Only the first two queries matter in practice: the LLM's specific pick
+    # and (usually) one keyword fallback. Trying six queries per section on a
+    # long PDF is the dominant slow path; capping at 2 keeps builds fast.
     best = None
-    for q in section.queries:
+    for q in section.queries[:2]:
         results = []
         with ThreadPoolExecutor(max_workers=len(clients) or 1) as ex:
             for arts in ex.map(lambda c: c.search(q), clients):
@@ -657,28 +661,39 @@ def _relevance_blurb(body, art):
     return text
 
 
-def _llm_query_batch(bodies, period, batch_size=8):
-    """Pick the best illustratable object AND a one-line blurb for many passages
-    in few Groq calls. Returns a list of (query, blurb) tuples the same length as
-    bodies; entries are (None, "") on failure so callers fall back to keywords."""
+def _llm_query_batch(bodies, period, batch_size=12):
+    """For each passage, identify (a) the single most vivid physical object a
+    museum would have a good image of, (b) the exact sentence from the passage
+    that refers to it, and (c) the exact word/phrase inside that sentence that
+    names it. Returns a list of (query, sentence, term) tuples, one per body.
+
+    If the passage contains nothing concrete and depictable, or the LLM can't
+    pin the object to a specific sentence-and-word, the entry is (None, "", "")
+    and the caller should skip the section entirely (no image).
+
+    Uses a batched call so long PDFs stay fast. Requires GROQ_API_KEY."""
     import os
     if not os.environ.get("GROQ_API_KEY") or not bodies:
-        return [(None, "")] * len(bodies)
+        return [(None, "", "")] * len(bodies)
     era = "" if period in ("any", None) else f" All passages are from the {period} period; prefer objects of that era."
-    out = [(None, "")] * len(bodies)
+    out = [(None, "", "")] * len(bodies)
     for start in range(0, len(bodies), batch_size):
         chunk = bodies[start:start + batch_size]
-        numbered = "\n\n".join(f"[{i+1}] {b[:800]}" for i, b in enumerate(chunk))
+        numbered = "\n\n".join(f"[{i+1}] {b[:900]}" for i, b in enumerate(chunk))
         prompt = (
-            "For each numbered passage, name the single most vivid physical "
-            "object, artwork, creature, structure, or artifact a museum would "
-            "have a good image of, and write one short sentence saying how it "
-            "relates to the passage." + era +
-            " Reply one line per passage in EXACTLY this form:\n"
-            "N | <search query, 2-5 words> | <one-sentence blurb>\n"
-            "Use NONE as the query if a passage has nothing concrete. Reply with "
-            "ONLY these lines.\n\n" + numbered)
-        text = _groq_chat(prompt, max_tokens=60 * len(chunk) + 20)
+            "For each numbered passage, identify the single most vivid physical "
+            "object, creature, artifact, or structure that a museum would have a "
+            "good image of AND that is named by a specific word or phrase in the "
+            "passage." + era + "\n\n"
+            "Reply one line per passage in EXACTLY this pipe-delimited form:\n"
+            "N | <museum search query, 2-5 English words> | <the exact sentence from the passage that mentions the object, copied verbatim> | <the exact word or short phrase from that sentence that names the object, copied verbatim>\n\n"
+            "Rules:\n"
+            "- The sentence and word MUST be copied verbatim from the passage, preserving original spelling and diacritics.\n"
+            "- The word must appear inside the sentence you chose.\n"
+            "- If the passage contains nothing concrete and depictable, or you cannot pin the object to a specific word in a specific sentence, reply: N | NONE | | \n"
+            "- Reply with ONLY these lines, one per passage, no preamble.\n\n"
+            + numbered)
+        text = _groq_chat(prompt, max_tokens=180 * len(chunk) + 40)
         if not text:
             continue
         for line in text.splitlines():
@@ -686,12 +701,28 @@ def _llm_query_batch(bodies, period, batch_size=8):
             if not m:
                 continue
             idx = int(m.group(1)) - 1
-            rest = m.group(2)
-            parts = [x.strip() for x in rest.split("|")]
-            q = parts[0].strip('".').strip()
-            blurb = parts[1].strip() if len(parts) > 1 else ""
-            if 0 <= idx < len(chunk) and q and q.upper() != "NONE" and len(q) <= 60:
-                out[start + idx] = (q, blurb)
+            if not (0 <= idx < len(chunk)):
+                continue
+            parts = [x.strip() for x in m.group(2).split("|")]
+            if len(parts) < 3:
+                continue
+            q = parts[0].strip('"\u201c\u201d.').strip()
+            sentence = parts[1].strip().strip('"\u201c\u201d').strip()
+            term = parts[2].strip().strip('"\u201c\u201d.,;:').strip()
+            if not q or q.upper() == "NONE" or len(q) > 60:
+                continue
+            if not sentence or not term:
+                continue
+            # Verify the sentence and word are actually in the passage (so we
+            # never bold a hallucinated word). Case- and diacritic-insensitive.
+            body_norm = _norm(chunk[idx])
+            if _norm(term) not in body_norm:
+                continue
+            if _norm(sentence[:60]) not in body_norm:
+                # sentence not verifiable; still accept if term is present, but
+                # fall back to a locally-derived sentence at render time
+                sentence = ""
+            out[start + idx] = (q, sentence, term)
     return out
 
 
@@ -924,6 +955,7 @@ def _find_gaps(page, margin=54):
 
 
 def _caption_lines(art, sec):
+    """Plain-text caption fallback (used only if HTML rendering fails)."""
     parts = []
     if getattr(sec, "blurb", ""):
         parts.append(sec.blurb)
@@ -933,11 +965,53 @@ def _caption_lines(art, sec):
     return "\n".join(parts)
 
 
+def _caption_html(art, sec):
+    """Caption as HTML so we can bold the specific Latin word the image
+    illustrates. Order: the Latin sentence with the term bolded, then any
+    note, then the full museum citation in a smaller line."""
+    import html
+    lines = []
+    sentence = getattr(sec, "blurb", "") or ""
+    term = getattr(sec, "blurb_bold", "") or ""
+    if sentence and term:
+        # Bold the term inside the sentence. Case-insensitive; keep the
+        # original casing/diacritics from the sentence itself.
+        pat = re.compile(re.escape(term), re.IGNORECASE)
+        esc = html.escape(sentence)
+        # apply bolding to the escaped string; term may be a phrase
+        esc = pat.sub(lambda m: f"<b>{html.escape(m.group(0))}</b>",
+                      html.escape(sentence))
+        lines.append(f'<div style="font-style:italic">{esc}</div>')
+    elif sentence:
+        lines.append(f'<div style="font-style:italic">{html.escape(sentence)}</div>')
+    if sec.note:
+        lines.append(f'<div>{html.escape(sec.note)}</div>')
+    lines.append(f'<div style="font-size:6.5pt;color:#333">{html.escape(art.citation())}</div>')
+    return ('<div style="font-family:Times,serif;font-size:7.5pt;'
+            'text-align:center;color:#262626;line-height:1.35">'
+            + "".join(lines) + '</div>')
+
+
 # Sizing targets (points).
 CAPTION_H = 62          # room for a relevance blurb + full citation
 MIN_IMG_H = 70          # smallest image we'll shrink to before spilling
 MAX_IMG_H = 300         # cap so a tall image doesn't dominate
 TARGET_IMG_W_FRAC = 0.62  # aim for ~62% of the text column width
+
+
+def _draw_caption(page, rect, art, sec):
+    """Render the caption. Uses insert_htmlbox where available (so the specific
+    referring word can be bold inside its Latin sentence); falls back to
+    plain-text insert_textbox on older PyMuPDF."""
+    if hasattr(page, "insert_htmlbox"):
+        try:
+            page.insert_htmlbox(rect, _caption_html(art, sec))
+            return
+        except Exception:
+            pass
+    page.insert_textbox(rect, _caption_lines(art, sec),
+                        fontsize=7.5, fontname="Times-Italic",
+                        align=fitz.TEXT_ALIGN_CENTER, color=(0.15, 0.15, 0.15))
 
 
 def _place_in_gap(page, gap, art, sec, plate_no, margin=54):
@@ -961,23 +1035,21 @@ def _place_in_gap(page, gap, art, sec, plate_no, margin=54):
     cx = w / 2
     box = fitz.Rect(cx - iw / 2, top + 6, cx + iw / 2, top + 6 + ih)
     page.insert_image(box, filename=str(art.image_path), keep_proportion=True)
-    page.insert_textbox(
-        fitz.Rect(margin, box.y1 + 4, w - margin, box.y1 + 4 + CAPTION_H),
-        _caption_lines(art, sec), fontsize=7.5, fontname="Times-Italic",
-        align=fitz.TEXT_ALIGN_CENTER, color=(0.15, 0.15, 0.15))
+    _draw_caption(page,
+                  fitz.Rect(margin, box.y1 + 4, w - margin, box.y1 + 4 + CAPTION_H),
+                  art, sec)
 
 
 def _spill_page(doc, after_page, art, sec, plate_no):
     """No room on the page: create a dedicated plate page right after it."""
     w, h = doc[after_page].rect.width, doc[after_page].rect.height
     page = doc.new_page(pno=after_page + 1, width=w, height=h)
-    margin, cap_h = 54, 60
+    margin, cap_h = 54, 72
     page.insert_image(fitz.Rect(margin, margin, w - margin, h - margin - cap_h),
                       filename=str(art.image_path), keep_proportion=True)
-    page.insert_textbox(
-        fitz.Rect(margin, h - margin - cap_h + 8, w - margin, h - margin + 10),
-        _caption_lines(art, sec), fontsize=8, fontname="Times-Italic",
-        align=fitz.TEXT_ALIGN_CENTER, color=(0.15, 0.15, 0.15))
+    _draw_caption(page,
+                  fitz.Rect(margin, h - margin - cap_h + 8, w - margin, h - margin),
+                  art, sec)
 
 
 # A gap must hold a small-but-legible image plus its citation, else we spill.
@@ -1164,28 +1236,41 @@ def cmd_build(args):
         sys.exit("No section markers matched; nothing to do.")
 
     print(f"\nSearching museum collections for {len(found)} section(s)...\n")
-    searchable = [s for s in found if s.queries]
+    candidates = [s for s in found if s.queries]
 
-    # One batched Groq pass: query + blurb per passage (fast, and gives blurbs).
-    bodies = [getattr(s, "_body", "") or "" for s in searchable]
+    # One batched Groq pass returns, for each passage: (search query, the exact
+    # sentence in the passage that refers to a concrete object, the exact word
+    # inside that sentence naming it). Sections without a specific referring
+    # word are dropped -- we don't illustrate what the text doesn't name.
+    bodies = [getattr(s, "_body", "") or "" for s in candidates]
     picks = _llm_query_batch(bodies, period)
-    for sec, (pick, blurb) in zip(searchable, picks):
-        if pick:
-            q = pick
-            if period == "ancient" and "roman" not in q.lower() and "greek" not in q.lower():
-                q = f"roman {q}"
-            elif period not in ("any", None) and period != "ancient" and period not in q.lower():
-                q = f"{period} {q}"
-            sec.queries = [q] + [x for x in sec.queries if x != q]
-            sec.blurb = blurb or ""
+    searchable = []
+    for sec, (pick, sentence, term) in zip(candidates, picks):
+        if not pick or not term:
+            # No specific concrete referent -> no image for this passage.
+            continue
+        q = pick
+        if period == "ancient" and "roman" not in q.lower() and "greek" not in q.lower():
+            q = f"roman {q}"
+        elif period not in ("any", None) and period != "ancient" and period not in q.lower():
+            q = f"{period} {q}"
+        sec.queries = [q] + [x for x in sec.queries if x != q]
+        sec.blurb = sentence or ""
+        sec.blurb_bold = term
+        searchable.append(sec)
+
+    if not searchable:
+        sys.exit("No passages named a specific illustratable object; nothing to do.")
 
     def _do(sec):
         return sec, find_artwork(sec, clients, prefer, args.min_score,
                                  args.verbose, period)
 
-    # Search all sections concurrently.
+    # Search all sections concurrently. Workers scale with the number of
+    # sections rather than being capped at 3; each worker does a short burst of
+    # museum HTTP calls, so 8 in parallel is comfortable on the free tier.
     results = {}
-    with ThreadPoolExecutor(max_workers=min(3, max(1, len(searchable)))) as ex:
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(searchable)))) as ex:
         for sec, art in ex.map(_do, searchable):
             results[id(sec)] = art
 
@@ -1212,7 +1297,7 @@ def cmd_build(args):
         return
 
     # Download all chosen images concurrently.
-    with ThreadPoolExecutor(max_workers=min(3, max(1, len(matched)))) as ex:
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(matched)))) as ex:
         list(ex.map(lambda s: download_image(s.artwork, session), matched))
     matched = [s for s in matched if s.artwork.image_path]
     matched.sort(key=lambda s: s.page_index)
